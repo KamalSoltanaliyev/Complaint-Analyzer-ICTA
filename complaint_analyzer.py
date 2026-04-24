@@ -25,6 +25,33 @@ class ComplaintKPIAnalyzer:
 
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    # ------------------------------ KPI LOOKUP BUILDER --------------------------
+    def build_kpi_lookup(self, kpi_list: List[Dict]) -> Dict[str, Dict]:
+        """
+        Build a lookup dictionary mapping KPI IDs to full KPI objects.
+        
+        Args:
+            kpi_list: List of KPI dictionaries from Excel
+            
+        Returns:
+            Dictionary with {kpi_id: {'kpi_id', 'kpi_name', 'description'}}
+        """
+        lookup = {}
+        for kpi in kpi_list:
+            # Handle different possible ID column names
+            kpi_id = str(kpi.get("ID") or kpi.get("id") or kpi.get("KPI_ID") or "").strip()
+            if kpi_id:
+                # Get English name (preferred), fall back to Azerbaijani
+                kpi_name = kpi.get("Göstərici (eng)") or kpi.get("Göstərici") or kpi.get("name") or kpi.get("KPI_NAME") or ""
+                description = kpi.get("Göstəricinin izahı") or kpi.get("description") or kpi.get("desc") or ""
+                
+                lookup[kpi_id] = {
+                    "kpi_id": kpi_id,
+                    "kpi_name": str(kpi_name).strip(),
+                    "description": str(description).strip()
+                }
+        return lookup
+
     # ------------------------------ TABLE LOADER ------------------------------
     def load_table(self, path: str) -> pd.DataFrame:
         ext = path.lower()
@@ -71,25 +98,35 @@ class ComplaintKPIAnalyzer:
     # -------------------------------------------------------------------------
 
     def _build_kpi_str(self, kpi_list: List[Dict]) -> str:
+        """Build formatted KPI list for prompt with ID, English name, Azerbaijani name, and description."""
         lines = []
         for k in kpi_list:
-            kid = str(k.get("id") or k.get("KPI_ID") or "")
-            name = k.get("name") or k.get("KPI_NAME") or k.get("Göstərici") or ""
-            desc = k.get("description") or k.get("desc") or k.get("Göstəricinin izahı") or ""
-            lines.append(f"{kid}: {name} — {desc}")
+            kid = str(k.get("ID") or k.get("id") or k.get("KPI_ID") or "").strip()
+            # Get English name (preferred), then Azerbaijani, then fallback
+            eng_name = k.get("Göstərici (eng)") or k.get("name") or ""
+            az_name = k.get("Göstərici") or ""
+            desc = k.get("Göstəricinin izahı") or k.get("description") or k.get("desc") or ""
+            
+            # Format: ID: English name (Azerbaijani name) — description
+            if eng_name and az_name:
+                line = f"{kid}: {eng_name} ({az_name}) — {desc}"
+            elif eng_name:
+                line = f"{kid}: {eng_name} — {desc}"
+            elif az_name:
+                line = f"{kid}: {az_name} — {desc}"
+            else:
+                line = f"{kid}: {desc}"
+            
+            if kid:  # Only add if we have an ID
+                lines.append(line)
         return "\n".join(lines)
 
     def create_prompt(self, complaints_batch: List[Dict], kpi_list: List[Dict], providers: List[str]) -> str:
-        providers_str = ", ".join(providers)
         kpi_str = self._build_kpi_str(kpi_list)
         complaints_text = "\n".join([f"{c['complaint_id']}: {c['description']}" for c in complaints_batch])
 
         prompt = f"""
-You are a precise assistant analyzing telecom complaints.
-
----PROVIDERS---
-{providers_str}
----END PROVIDERS---
+You are a telecom complaint classifier.
 
 ---KPI LIST---
 {kpi_str}
@@ -100,16 +137,27 @@ You are a precise assistant analyzing telecom complaints.
 ---END COMPLAINTS---
 
 Task:
-For each complaint, return valid JSON with:
-{{
-  "id": "<complaint_id>",
-  "operator": "<provider name or null>",
-  "kpis": [{{"kpi_id":"<KPI id>","kpi_name":"<KPI name>","reason":"<6-25 words>","confidence":0.00}}]
-}}
+For each complaint, select the most relevant KPI IDs from the KPI LIST.
 
-Return only JSON array: [ {{...}}, {{...}}, ... ]
+Rules:
+- Use ONLY KPI IDs from the provided list
+- DO NOT generate KPI names or descriptions
+- Match based on meaning (e.g., latency, jitter, packet loss, speed, interruptions)
+- If no KPI matches, return an empty list
+
+Output JSON format:
+[
+  {{
+    "id": "<complaint_id>",
+    "operator": null,
+    "kpis": [
+      {{"kpi_id": "5", "confidence": 0.85}}
+    ]
+  }}
+]
 """
         return prompt
+
 
     def _extract_json_block(self, text: str) -> str:
         t = text.strip()
@@ -123,6 +171,9 @@ Return only JSON array: [ {{...}}, {{...}}, ... ]
         import random
         start_time = time.time()
         prompt = self.create_prompt(complaints_batch, kpi_list, providers)
+        
+        # Build KPI lookup for validation and mapping
+        kpi_lookup = self.build_kpi_lookup(kpi_list)
 
         # create a local client per call to be safe for multithreading
         try:
@@ -152,7 +203,7 @@ Return only JSON array: [ {{...}}, {{...}}, ... ]
             print(f"DEBUG: raw ChatGPT response (first 300 chars): {content[:300]}\n  (elapsed {elapsed:.2f}s)")
         except Exception as e:
             print("⚠ API error:", e)
-            return [{"complaint_id": c['complaint_id'], "complaint_text": c['description'],
+            return [{"complaint_id": c['complaint_id'], "subject_of_the_complaint": c['description'],
                      "operator": None, "kpis": [], "status": "API_ERROR"} for c in complaints_batch]
 
         parsed = []
@@ -178,45 +229,60 @@ Return only JSON array: [ {{...}}, {{...}}, ... ]
         for i, c in enumerate(complaints_batch):
             if i < len(parsed):
                 raw = parsed[i]
-                # Normalize fields: remove model-provided 'id' and keep complaint_id from input
                 operator = raw.get('operator') if isinstance(raw, dict) else None
 
-                # Build kpis list keeping only 'reason'
+                # Process KPIs: map KPI IDs to actual KPI data from lookup
                 kpis_out = []
                 raw_kpis = raw.get('kpis') if isinstance(raw, dict) else None
+                
                 if isinstance(raw_kpis, list):
                     for kp in raw_kpis:
                         if isinstance(kp, dict):
-                            reason = kp.get('reason') or kp.get('reason'.lower()) or kp.get('kpi_name') or kp.get('kpi_id') or None
-                            if reason:
-                                kpis_out.append({'reason': reason})
-                        else:
-                            # if kp is a string, use it as reason
+                            # Extract KPI ID from response
+                            kpi_id = str(kp.get('kpi_id') or "").strip()
+                            confidence = kp.get('confidence', 0.0)
+                            
+                            # Validate confidence is a number
                             try:
-                                txt = str(kp).strip()
-                                if txt:
-                                    kpis_out.append({'reason': txt})
-                            except Exception:
-                                pass
-
+                                confidence = float(confidence)
+                                # Clamp confidence to 0.0-1.0 range
+                                confidence = max(0.0, min(1.0, confidence))
+                            except (TypeError, ValueError):
+                                confidence = 0.0
+                            
+                            # Validate KPI ID exists in lookup (only include valid KPIs)
+                            if kpi_id and kpi_id in kpi_lookup:
+                                # Use pre-built KPI data from lookup
+                                kpi_data = kpi_lookup[kpi_id]
+                                kpis_out.append({
+                                    'kpi_id': kpi_data['kpi_id'],
+                                    'kpi_name': kpi_data['kpi_name'],
+                                    'description': kpi_data['description'],
+                                    'confidence': confidence
+                                })
+                            elif kpi_id:
+                                # Invalid KPI ID returned by model - log warning and ignore
+                                print(f"⚠ WARNING: Invalid/non-existent KPI ID '{kpi_id}' returned by model for complaint {c['complaint_id']} - ignoring")
+                
                 new_entry = {
                     'complaint_id': c['complaint_id'],
                     'operator': operator if operator is not None else None,
                     'kpis': kpis_out,
-                    'complaint_text': c['description'],
+                    'subject_of_the_complaint': c['description'],
                     'status': 'OK'
                 }
                 results.append(new_entry)
             else:
                 results.append({
                     'complaint_id': c['complaint_id'],
-                    'complaint_text': c['description'],
+                    'subject_of_the_complaint': c['description'],
                     'operator': None,
                     'kpis': [],
                     'status': 'EMPTY_RESPONSE'
                 })
 
         return results
+
 
     # -------------------------------------------------------------------------
 

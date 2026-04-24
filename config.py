@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 # Load environment variables from .env (if present)
 load_dotenv()
 
-# OpenAI API Configuration (set in .env or system env)
+# OpenAI API Configuration (set in .env     or system env)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 MODEL = os.getenv("MODEL", "gpt-4o-mini")
 
